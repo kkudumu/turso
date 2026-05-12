@@ -10485,3 +10485,39 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     let rows = get_rows(&conn1, "SELECT * FROM t1");
     assert_eq!(rows.len(), 1);
 }
+
+#[test]
+fn abandoned_exclusive_commit_at_should_not_block_subsequent_concurrent_writer() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    match conn_a.prepare("COMMIT").unwrap().step().unwrap() {
+        StepResult::IO => {} // tx will immediately hit injected yield point
+        other => panic!("tx should yield, got: {other:?}"),
+    }
+
+    assert!(
+        matches!(conn_a.prepare("COMMIT").unwrap().step().err().unwrap(),
+            LimboError::TxError(msg) if msg == "cannot commit - no transaction is active")
+    );
+
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    match conn_b.prepare("COMMIT").unwrap().step() {
+        Ok(StepResult::IO) => {}
+        Err(err) => panic!("conn_b COMMIT must not error; got: {err:?}"),
+        _ => {}
+    }
+}

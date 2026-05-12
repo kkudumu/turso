@@ -204,6 +204,27 @@ impl CommitState {
             CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
         }
     }
+
+    fn has_uncommitted_rollbackable_mvcc_commit(
+        &mut self,
+        main_mv_store: Option<&Arc<MvStore>>,
+    ) -> bool {
+        match self {
+            CommitState::CommittingMvcc { state_machine } => main_mv_store.is_some_and(|store| {
+                state_machine
+                    .inner_mut()
+                    .is_uncommitted_and_rollbackable(store)
+            }),
+            CommitState::CommittingAttachedMvcc {
+                state_machine,
+                mv_store,
+                ..
+            } => state_machine
+                .inner_mut()
+                .is_uncommitted_and_rollbackable(mv_store),
+            CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2192,6 +2213,15 @@ impl Program {
         // state machine cannot run its own error cleanup. abort() is the first
         // statement cleanup path that still owns that commit_state.
         state.commit_state.cleanup_mvcc_checkpoint_state();
+        if err.is_none()
+            && state
+                .commit_state
+                .has_uncommitted_rollbackable_mvcc_commit(self.connection.mv_store().as_ref())
+        {
+            self.connection.rollback_manual_txn_cleanup(pager, true);
+            state.commit_state = CommitState::Ready;
+            state.auto_txn_cleanup = TxnCleanup::None;
+        }
 
         // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
         // releases nested guards. Clean it before checking whether this program

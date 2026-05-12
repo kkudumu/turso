@@ -1092,6 +1092,12 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
     }
 
+    pub(crate) fn is_uncommitted_and_rollbackable(&self, mvcc_store: &Arc<MvStore<Clock>>) -> bool {
+        !self.is_finalized
+            && !matches!(self.state, CommitState::Checkpoint { .. })
+            && mvcc_store.is_tx_rollbackable(self.tx_id)
+    }
+
     fn new(
         state: CommitState<Clock>,
         tx_id: TxID,
