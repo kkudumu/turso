@@ -16,7 +16,7 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::{Arc, Weak};
+use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
 use crate::types::compare_immutable;
@@ -1016,14 +1016,9 @@ fn commit_yield_key(tx_id: u64) -> u64 {
 #[cfg(any(test, injected_yields))]
 impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
     fn yield_context(&self) -> YieldContext {
-        let (injector, failure_injector) = self
-            .connection
-            .upgrade()
-            .map(|connection| (connection.yield_injector(), connection.failure_injector()))
-            .unwrap_or((None, None));
         YieldContext::new(
-            injector,
-            failure_injector,
+            self.connection.yield_injector(),
+            self.connection.failure_injector(),
             self.yield_instance_id,
             commit_yield_key(self.tx_id),
         )
@@ -1037,8 +1032,8 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
-    mvcc_store: Weak<MvStore<Clock>>,
-    connection: Weak<Connection>,
+    mvcc_store: Arc<MvStore<Clock>>,
+    connection: Arc<Connection>,
     /// Database index this commit is for (`MAIN_DB_ID` or an attached-db id).
     /// Threaded through so that `finish_committed_tx` can clear the matching
     /// connection-level mv_tx slot atomically with `remove_tx`.
@@ -1108,7 +1103,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     fn new(
         state: CommitState<Clock>,
         tx_id: TxID,
-        mvcc_store: Weak<MvStore<Clock>>,
+        mvcc_store: Arc<MvStore<Clock>>,
         connection: Arc<Connection>,
         db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
@@ -1135,7 +1130,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
             mvcc_store,
-            connection: Arc::downgrade(&connection),
+            connection,
             db_id,
             commit_coordinator,
             pager,
@@ -1144,12 +1139,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             sync_mode,
             _phantom: PhantomData,
         }
-    }
-
-    fn connection(&self) -> Result<Arc<Connection>> {
-        self.connection.upgrade().ok_or_else(|| {
-            LimboError::InternalError("MVCC commit connection was dropped".to_string())
-        })
     }
 
     /// Dropped COMMIT statements can abandon this state machine while it still
@@ -1163,21 +1152,15 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             self.end_read_tx_for_db();
             return;
         }
-        let Some(mvcc_store) = self.mvcc_store.upgrade() else {
-            self.end_read_tx_for_db();
-            return;
-        };
-        let connection = self.connection.upgrade();
-        mvcc_store.cleanup_dropped_commit(self.tx_id, connection.as_deref(), self.db_id);
+        self.mvcc_store
+            .cleanup_dropped_commit(self.tx_id, self.connection.as_ref(), self.db_id);
         self.end_read_tx_for_db();
     }
 
     fn end_read_tx_for_db(&self) {
-        if let Some(connection) = self.connection.upgrade() {
-            if let Ok(pager) = connection.get_pager_from_database_index(&self.db_id) {
-                pager.end_read_tx();
-                return;
-            }
+        if let Ok(pager) = self.connection.get_pager_from_database_index(&self.db_id) {
+            pager.end_read_tx();
+            return;
         }
         self.pager.end_read_tx();
     }
@@ -1759,8 +1742,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
-                    let connection = self.connection()?;
-                    mvcc_store.finish_committed_tx(self.tx_id, &connection, self.db_id);
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -1845,8 +1827,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
-                    let connection = self.connection()?;
-                    mvcc_store.finish_committed_tx(self.tx_id, &connection, self.db_id);
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -1917,7 +1898,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
-                let connection = self.connection()?;
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
@@ -1932,8 +1912,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .map(|header| header.schema_cookie.get())
                         != Some(tx_header.schema_cookie.get());
                 if schema_did_change {
-                    let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema);
+                    let schema = self.connection.schema.read().clone();
+                    self.connection.db.update_schema_if_newer(schema);
                 }
                 self.header.write().replace(tx_header);
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
@@ -2017,21 +1997,19 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // transaction. Pair removal with the connection cache clear so
                 // an IO yield + abandon during the upcoming checkpoint cannot
                 // strand `conn.mv_tx_id` referencing a tx that's gone from `txs`.
-                let connection = self.connection()?;
-                mvcc_store.finish_committed_tx(self.tx_id, &connection, self.db_id);
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
 
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
                 if mvcc_store.storage.should_checkpoint() {
-                    let connection = self.connection()?;
                     let state_machine = StateMachine::new(CheckpointStateMachine::new(
                         self.pager.clone(),
                         mvcc_store.clone(),
-                        connection.clone(),
+                        self.connection.clone(),
                         false,
-                        connection.get_sync_mode(),
+                        self.connection.get_sync_mode(),
                     ));
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
@@ -3747,7 +3725,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let state = Box::new(CommitStateMachine::new(
             CommitState::Initial,
             tx_id,
-            Arc::downgrade(self),
+            self.clone(),
             connection.clone(),
             db_id,
             self.commit_coordinator.clone(),
@@ -3847,11 +3825,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.remove_tx(tx_id);
     }
 
-    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: Option<&Connection>, db_id: usize) {
+    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
         let tx_state = self.txs.get(&tx_id).map(|tx| tx.value().state.load());
         match tx_state {
             Some(TransactionState::Active | TransactionState::Preparing(_)) => {
-                self.rollback_tx_inner(tx_id, connection, db_id);
+                self.rollback_tx_inner(tx_id, Some(connection), db_id);
             }
             Some(TransactionState::Committed(_)) => {
                 if let Some(tx) = self.txs.get(&tx_id) {
@@ -3862,10 +3840,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
-                if let Some(connection) = connection {
-                    if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
-                        connection.set_mv_tx_for_db(db_id, None);
-                    }
+                if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
+                    connection.set_mv_tx_for_db(db_id, None);
                 }
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
