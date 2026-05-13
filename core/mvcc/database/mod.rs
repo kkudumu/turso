@@ -991,6 +991,7 @@ pub(crate) enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     LogRecordPrepared,
+    BeforeFinishCommittedTx,
     /// Boundary right after `remove_tx` runs but before the connection cache
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
@@ -1144,17 +1145,35 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     /// Dropped COMMIT statements can abandon this state machine while it still
     /// owns MVCC transaction state, commit locks, or checkpoint read state.
     fn cleanup_unfinished_commit(&mut self) {
-        if self.is_finalized {
-            return;
-        }
-        self.cleanup_mvcc_checkpoint_state();
-        if matches!(self.state, CommitState::Checkpoint { .. }) {
+        if !self.is_finalized {
+            self.cleanup_mvcc_checkpoint_state();
+            if !matches!(self.state, CommitState::Checkpoint { .. }) {
+                self.mvcc_store.cleanup_dropped_commit(
+                    self.tx_id,
+                    self.connection.as_ref(),
+                    self.db_id,
+                );
+            }
             self.end_read_tx_for_db();
-            return;
         }
-        self.mvcc_store
-            .cleanup_dropped_commit(self.tx_id, self.connection.as_ref(), self.db_id);
-        self.end_read_tx_for_db();
+
+        let tx_id = self.tx_id;
+        let db_id = self.db_id;
+        turso_assert!(
+            self.mvcc_store.txs.get(&tx_id).is_none(),
+            "MVCC tx should be removed from txs after a successful commit",
+            { "tx_id": tx_id }
+        );
+        turso_assert!(
+            !self.mvcc_store.is_exclusive_tx(&tx_id),
+            "MVCC tx should not still hold the exclusive slot after a successful commit",
+            { "tx_id": tx_id }
+        );
+        turso_assert!(
+            self.connection.get_mv_tx_id_for_db(db_id) != Some(tx_id),
+            "Connection should not still reference an MVCC tx after a successful commit",
+            { "tx_id": tx_id, "db_id": db_id }
+        );
     }
 
     fn end_read_tx_for_db(&self) {
@@ -1997,6 +2016,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // transaction. Pair removal with the connection cache clear so
                 // an IO yield + abandon during the upcoming checkpoint cannot
                 // strand `conn.mv_tx_id` referencing a tx that's gone from `txs`.
+                inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
 
@@ -3838,6 +3858,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
+                self.finish_committed_tx(tx_id, connection, db_id);
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {

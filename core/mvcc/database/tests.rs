@@ -5,6 +5,7 @@ use crate::io::PlatformIO;
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
+use crate::mvcc::database::CommitYieldPoint;
 use crate::mvcc::persistent_storage::logical_log::{
     ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
 };
@@ -10486,8 +10487,9 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     assert_eq!(rows.len(), 1);
 }
 
+// https://github.com/tursodatabase/turso/issues/6755
 #[test]
-fn abandoned_exclusive_commit_at_should_not_block_subsequent_concurrent_writer() {
+fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn_a = db.connect();
     let conn_b = db.connect();
@@ -10520,4 +10522,32 @@ fn abandoned_exclusive_commit_at_should_not_block_subsequent_concurrent_writer()
         Err(err) => panic!("conn_b COMMIT must not error; got: {err:?}"),
         _ => {}
     }
+}
+
+// https://github.com/tursodatabase/turso/issues/6751
+#[test]
+fn abandoned_commit_in_committed_state_should_not_block_subsequent_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn_a.execute("BEGIN IMMEDIATE").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+
+    match conn_a.prepare("COMMIT").unwrap().step().unwrap() {
+        StepResult::IO => {}
+        other => panic!("tx should yield, got: {other:?}"),
+    }
+
+    let _ = conn_a.prepare("COMMIT").unwrap().step();
+
+    conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 }
